@@ -3,7 +3,7 @@ name: Terraform CI
 on:
   pull_request:
     branches:
-      - mainterraform state list
+      - main
 
 jobs:
   terraform:
