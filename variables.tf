@@ -31,3 +31,13 @@ variable "availability_zones" {
   description = "Availability zones for the subnets"
   type        = list(string)
 }
+
+variable "ami_id" {
+  description = "The AMI ID for the EC2 instance"
+  type        = string
+}
+
+variable "app_port" {
+  description = "The port on which the application runs"
+  type        = number
+}
