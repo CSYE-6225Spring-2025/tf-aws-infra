@@ -41,3 +41,30 @@ variable "app_port" {
   description = "The port on which the application runs"
   type        = number
 }
+
+# variable "s3_bucket_name" {
+#   description = "S3 Bucket Name"
+#   type        = string
+# }
+
+variable "db_username" {
+  description = "Database admin username"
+  type        = string
+  sensitive   = true
+}
+
+variable "db_password" {
+  description = "Database admin password"
+  type        = string
+  sensitive   = true
+}
+
+variable "db_name" {
+  description = "The name of the database"
+  type        = string
+}
+
+variable "db_dialect" {
+  description = "The database"
+  type        = string
+}
