@@ -32,7 +32,7 @@ To setup the terraform infra you have to create .tfvars with details
 
 5. Apply the configuration
 
-   terraform apply
+   terraform applyy
 
 6. To destroy the infrastructure
 

@@ -68,3 +68,8 @@ variable "db_dialect" {
   description = "The database"
   type        = string
 }
+
+variable "domain_name" {
+  description = "Your registered domain name"
+  type        = string
+}

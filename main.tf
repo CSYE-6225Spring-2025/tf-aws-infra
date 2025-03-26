@@ -296,6 +296,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "app_bucket_encryp
   }
 }
 
+
 # ✅ Lifecycle rule (Objects transition to STANDARD_IA after 30 days)
 resource "aws_s3_bucket_lifecycle_configuration" "app_bucket_lifecycle" {
   bucket = aws_s3_bucket.app_bucket.id
@@ -311,6 +312,58 @@ resource "aws_s3_bucket_lifecycle_configuration" "app_bucket_lifecycle" {
   }
 }
 
+
+# CloudWatch Agent IAM Role
+resource "aws_iam_role" "cloudwatch_agent_role" {
+  name = "cloudwatch-agent-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+# CloudWatch Agent Policy
+resource "aws_iam_policy" "cloudwatch_agent_policy" {
+  name        = "cloudwatch-agent-policy"
+  description = "Policy for CloudWatch Agent on EC2"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "logs:PutLogEvents",
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams",
+          "logs:CreateLogGroup",
+          "logs:DescribeLogGroups",
+          "cloudwatch:PutMetricData",
+          "cloudwatch:ListMetrics",
+          "cloudwatch:GetMetricData",
+          "ssm:GetParameter",
+          "ec2:DescribeTags",
+          "ec2:DescribeInstances",
+          "ec2:DescribeVolumes",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Attach CloudWatch Policy to your existing EC2 role
+resource "aws_iam_role_policy_attachment" "attach_cloudwatch_policy" {
+  role       = aws_iam_role.ec2_s3_role.name
+  policy_arn = aws_iam_policy.cloudwatch_agent_policy.arn
+}
 
 # Create EC2 Instance
 resource "aws_instance" "app_server" {
@@ -352,6 +405,62 @@ sudo chmod 644 /var/www/webapp/.env
 # Log success message correctly
 echo "✅ .env file created successfully!"
 
+# Configure CloudWatch agent
+echo "⚙️ Configuring CloudWatch agent..."
+sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json > /dev/null << 'EOT'
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/webapp/application.log",
+            "log_group_name": "webapp-logs",
+            "log_stream_name": "{instance_id}-application",
+            "retention_in_days": 7
+          },
+          {
+            "file_path": "/var/log/webapp/error.log",
+            "log_group_name": "webapp-logs",
+            "log_stream_name": "{instance_id}-error",
+            "retention_in_days": 7
+          },
+          {
+            "file_path": "/var/log/user-data.log",
+            "log_group_name": "webapp-logs",
+            "log_stream_name": "{instance_id}-user-data",
+            "retention_in_days": 7
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "metrics_collected": {
+      "statsd": {
+        "service_address": ":8125",
+        "metrics_collection_interval": 10,
+        "metrics_aggregation_interval": 60
+      }
+    }
+  }
+}
+EOT
+
+# Create log directories if they don't exist
+sudo mkdir -p /var/log/webapp
+sudo chown csye6225:csye6225 /var/log/webapp
+sudo chmod 755 /var/log/webapp
+
+# Restart CloudWatch agent
+echo "🔄 Starting CloudWatch agent..."
+sudo systemctl restart amazon-cloudwatch-agent
+
 # Stop the service if it's already running (might be auto-started)
 sudo systemctl stop webapp || true
 
@@ -374,3 +483,30 @@ EOF
   }
 }
 
+resource "aws_route53_zone" "dev_zone" {
+  count = var.aws_profile == "UserDev" ? 1 : 0
+  name  = "dev.${var.domain_name}"
+}
+
+resource "aws_route53_zone" "demo_zone" {
+  count = var.aws_profile == "Demo-User" ? 1 : 0
+  name  = "demo.${var.domain_name}"
+}
+
+resource "aws_route53_record" "dev_a_record" {
+  count   = var.aws_profile == "UserDev" ? 1 : 0
+  zone_id = aws_route53_zone.dev_zone[0].zone_id
+  name    = "dev.${var.domain_name}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_instance.app_server.public_ip]
+}
+
+resource "aws_route53_record" "demo_a_record" {
+  count   = var.aws_profile == "Demo-User" ? 1 : 0
+  zone_id = aws_route53_zone.demo_zone[0].zone_id
+  name    = "demo.${var.domain_name}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_instance.app_server.public_ip]
+}
