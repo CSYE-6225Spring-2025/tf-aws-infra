@@ -27,13 +27,13 @@ output "rds_endpoint" {
   value       = aws_db_instance.app_db.address
 }
 
-output "dev_nameservers" {
-  value       = length(aws_route53_zone.dev_zone) > 0 ? aws_route53_zone.dev_zone[0].name_servers : []
-  description = "Nameservers for dev subdomain"
-}
+# output "dev_nameservers" {
+#   value       = length(aws_route53_zone.dev_zone) > 0 ? aws_route53_zone.dev_zone[0].name_servers : []
+#   description = "Nameservers for dev subdomain"
+# }
 
-output "demo_nameservers" {
-  value       = length(aws_route53_zone.demo_zone) > 0 ? aws_route53_zone.demo_zone[0].name_servers : []
-  description = "Nameservers for demo subdomain"
-}
+# output "demo_nameservers" {
+#   value       = length(aws_route53_zone.demo_zone) > 0 ? aws_route53_zone.demo_zone[0].name_servers : []
+#   description = "Nameservers for demo subdomain"
+# }
 
