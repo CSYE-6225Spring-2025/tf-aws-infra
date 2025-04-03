@@ -73,3 +73,13 @@ variable "domain_name" {
   description = "Your registered domain name"
   type        = string
 }
+
+variable "subdomain" {
+  description = "Your registered sub domain name"
+  type        = string
+}
+
+variable "key_name" {
+  description = "Your Key Name"
+  type        = string
+}
