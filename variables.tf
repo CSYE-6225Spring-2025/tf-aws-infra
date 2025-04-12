@@ -53,10 +53,16 @@ variable "db_username" {
   sensitive   = true
 }
 
-variable "db_password" {
-  description = "Database admin password"
+# variable "db_password" {
+#   description = "Database admin password"
+#   type        = string
+#   sensitive   = true
+# }
+
+variable "demo_certificate_arn" {
+  description = "ARN of the manually imported SSL certificate for the demo environment"
   type        = string
-  sensitive   = true
+  default     = "" # optional: can leave empty if you're using tfvars
 }
 
 variable "db_name" {
