@@ -185,6 +185,26 @@ resource "aws_security_group" "rds_sg" {
   }
 }
 
+# Generate random password for RDS
+resource "random_password" "db_password" {
+  length           = 16
+  special          = false
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+
+# Store password in Secrets Manager
+resource "aws_secretsmanager_secret" "db_password" {
+  name        = "db-password-secret11"
+  description = "Secret containing the RDS database password"
+  kms_key_id  = aws_kms_key.kms_secrets_key.arn
+}
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = random_password.db_password.result
+}
+
 resource "aws_db_instance" "app_db" {
   db_name                = var.db_name
   identifier             = "csye6225"
@@ -193,7 +213,7 @@ resource "aws_db_instance" "app_db" {
   engine_version         = "8.0"
   instance_class         = "db.t3.micro"
   username               = var.db_username
-  password               = var.db_password
+  password               = random_password.db_password.result
   parameter_group_name   = aws_db_parameter_group.mysql_parameter_group.name
   skip_final_snapshot    = true
   publicly_accessible    = false
@@ -201,6 +221,7 @@ resource "aws_db_instance" "app_db" {
   db_subnet_group_name   = aws_db_subnet_group.db_subnet_group.name
   multi_az               = false
   storage_encrypted      = true
+  kms_key_id             = aws_kms_key.kms_rds_key.arn
 }
 
 
@@ -285,16 +306,16 @@ resource "aws_s3_bucket" "app_bucket" {
   }
 }
 
-# ✅ Separate resource for server-side encryption
-resource "aws_s3_bucket_server_side_encryption_configuration" "app_bucket_encryption" {
-  bucket = aws_s3_bucket.app_bucket.id
+# # ✅ Separate resource for server-side encryption
+# resource "aws_s3_bucket_server_side_encryption_configuration" "app_bucket_encryption" {
+#   bucket = aws_s3_bucket.app_bucket.id
 
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
+#   rule {
+#     apply_server_side_encryption_by_default {
+#       sse_algorithm = "AES256"
+#     }
+#   }
+# }
 
 
 # ✅ Lifecycle rule (Objects transition to STANDARD_IA after 30 days)
@@ -515,6 +536,33 @@ resource "aws_security_group" "lb_sg" {
 #   }
 # }
 
+
+resource "aws_iam_policy" "secrets_access_policy" {
+  name        = "ec2-secrets-access-policy"
+  description = "Allows EC2 to retrieve secrets from Secret Manager"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ],
+        Resource = [
+          aws_secretsmanager_secret.db_password.arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_secrets_attach" {
+  role       = aws_iam_role.ec2_s3_role.name
+  policy_arn = aws_iam_policy.secrets_access_policy.arn
+}
+
 # Launch Template for Auto Scaling
 resource "aws_launch_template" "app_launch_template" {
   name          = "csye6225_asg"
@@ -535,25 +583,72 @@ resource "aws_launch_template" "app_launch_template" {
 #!/bin/bash
 
 exec > /var/log/user-data.log 2>&1
+set -e
 
 echo "🚀 Starting user data execution..."
+
+
+# Install required packages
+echo "Installing required packages..."
+sudo apt-get update -y
+sudo apt-get install -y jq
+
+# Install AWS CLI v2
+echo "Installing AWS CLI v2..."
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+aws --version
+
+# Set variables from Terraform
+export RDS_SECRET_NAME="${aws_secretsmanager_secret.db_password.name}"
+export DB_HOST="${aws_db_instance.app_db.address}"
+export DB_USER="${var.db_username}"
+export DB_NAME="${var.db_name}"
+export APP_PORT="${var.app_port}"
+export S3_BUCKET_NAME="${aws_s3_bucket.app_bucket.bucket}"
+export AWS_REGION="${var.aws_region}"
+
+
+
+echo "Fetching database password from Secret Manager..."
+# Here $$ is needed to escape $ in bash variables
+RDS_SECRET=$(aws secretsmanager get-secret-value --region $${AWS_REGION} --secret-id "$${RDS_SECRET_NAME}" --query SecretString --output text)
+if [ $? -ne 0 ]; then
+  echo "Error fetching RDS secret"
+  # Fallback to using the direct password if secret retrieval fails
+  DB_PASSWORD_FETCHED="${random_password.db_password.result}"
+  echo "Using fallback password"
+else
+  echo "Secret retrieved successfully"
+  DB_PASSWORD_FETCHED="$RDS_SECRET"
+  echo "Password length: $${#DB_PASSWORD_FETCHED}"
+fi
+
+echo "DB_HOST=$${DB_HOST}"
+echo "DB_USER=$${DB_USER}"
+echo "DB_NAME=$${DB_NAME}"
+echo "APP_PORT=$${APP_PORT}"
+echo "S3_BUCKET_NAME=$${S3_BUCKET_NAME}"
+
 
 # Ensure the application directory exists
 sudo mkdir -p /var/www/webapp
 sudo chown csye6225:csye6225 /var/www/webapp
 sudo chmod 755 /var/www/webapp
 
-# Create and write the .env file
-echo "📝 Writing environment variables to /var/www/webapp/.env..."
-sudo tee /var/www/webapp/.env > /dev/null << 'EOT'
-DB_HOST=${aws_db_instance.app_db.address}
-DB_USER=${var.db_username}
-DB_PASS=${var.db_password}
-DB_NAME=${var.db_name}
-DB_DIALECT=mysql
-AWS_REGION=${var.aws_region}
-S3_BUCKET_NAME=${aws_s3_bucket.app_bucket.bucket}
-EOT
+# Create or update .env file
+echo "Creating/updating .env file..."
+sudo -u csye6225 bash -c "touch /var/www/webapp/.env"
+
+# Update environment variables
+sudo -u csye6225 bash -c "sed -i '/^DB_HOST=/d' /var/www/webapp/.env && echo \"DB_HOST=$${DB_HOST}\" >> /var/www/webapp/.env"
+sudo -u csye6225 bash -c "sed -i '/^DB_USER=/d' /var/www/webapp/.env && echo \"DB_USER=$${DB_USER}\" >> /var/www/webapp/.env"
+sudo -u csye6225 bash -c "sed -i '/^DB_PASS=/d' /var/www/webapp/.env && printf 'DB_PASS=%q\n' \"$${DB_PASSWORD_FETCHED}\" >> /var/www/webapp/.env"
+sudo -u csye6225 bash -c "sed -i '/^DB_NAME=/d' /var/www/webapp/.env && echo \"DB_NAME=$${DB_NAME}\" >> /var/www/webapp/.env"
+sudo -u csye6225 bash -c "sed -i '/^DB_DIALECT=/d' /var/www/webapp/.env && echo \"DB_DIALECT=mysql\" >> /var/www/webapp/.env"
+sudo -u csye6225 bash -c "sed -i '/^AWS_REGION=/d' /var/www/webapp/.env && echo \"AWS_REGION=$${AWS_REGION}\" >> /var/www/webapp/.env"
+sudo -u csye6225 bash -c "sed -i '/^S3_BUCKET_NAME=/d' /var/www/webapp/.env && echo \"S3_BUCKET_NAME=$${S3_BUCKET_NAME}\" >> /var/www/webapp/.env"
 
 # Set permissions
 sudo chown csye6225:csye6225 /var/www/webapp/.env
@@ -756,6 +851,275 @@ resource "aws_lb_listener" "app_listener" {
   }
 }
 
+data "aws_caller_identity" "current" {}
+
+# EC2 KMS Key
+resource "aws_kms_key" "kms_ec2_key" {
+  description             = "KMS key for EC2 instances"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  key_usage               = "ENCRYPT_DECRYPT"
+  rotation_period_in_days = 90
+}
+
+resource "aws_kms_alias" "kms_ec2_key_alias" {
+  name          = "alias/ec2-key"
+  target_key_id = aws_kms_key.kms_ec2_key.key_id
+}
+
+resource "aws_kms_key_policy" "kms_ec2_key_policy" {
+  key_id = aws_kms_key.kms_ec2_key.key_id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Id      = "kms-ec2-key-policy",
+    Statement = [
+      {
+        Sid    = "EnableAccountAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        },
+        Action   = "kms:*",
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowEC2RoleAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${aws_iam_role.ec2_s3_role.name}"
+        },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+          "kms:CreateGrant"
+        ],
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowAutoScalingServiceAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+        },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+          "kms:CreateGrant"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+
+# RDS KMS Key
+resource "aws_kms_key" "kms_rds_key" {
+  description             = "KMS key for RDS instances"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  key_usage               = "ENCRYPT_DECRYPT"
+  rotation_period_in_days = 90
+}
+
+
+
+resource "aws_kms_alias" "kms_rds_key_alias" {
+  name          = "alias/rds-key"
+  target_key_id = aws_kms_key.kms_rds_key.key_id
+}
+
+resource "aws_kms_key_policy" "kms_rds_key_policy" {
+  key_id = aws_kms_key.kms_rds_key.key_id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Id      = "kms-rds-key-policy",
+    Statement = [
+      {
+        Sid    = "EnableAccountAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        },
+        Action   = "kms:*",
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowRDSServiceAccess",
+        Effect = "Allow",
+        Principal = {
+          Service = "rds.amazonaws.com"
+        },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+          "kms:CreateGrant"
+        ],
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowEC2RoleAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${aws_iam_role.ec2_s3_role.name}"
+        },
+        Action = [
+          "kms:Decrypt",
+          "kms:DescribeKey"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+
+# S3 KMS Key
+resource "aws_kms_key" "kms_s3_key" {
+  description             = "KMS key for S3 buckets"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  key_usage               = "ENCRYPT_DECRYPT"
+  rotation_period_in_days = 90
+}
+
+resource "aws_kms_alias" "kms_s3_key_alias" {
+  name          = "alias/s3-key"
+  target_key_id = aws_kms_key.kms_s3_key.key_id
+}
+
+resource "aws_kms_key_policy" "kms_s3_key_policy" {
+  key_id = aws_kms_key.kms_s3_key.key_id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Id      = "kms-s3-key-policy",
+    Statement = [
+      {
+        Sid    = "EnableAccountAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        },
+        Action   = "kms:*",
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowS3ServiceAccess",
+        Effect = "Allow",
+        Principal = {
+          Service = "s3.amazonaws.com"
+        },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ],
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowEC2RoleAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${aws_iam_role.ec2_s3_role.name}"
+        },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+
+# Secrets Manager KMS Key
+resource "aws_kms_key" "kms_secrets_key" {
+  description             = "KMS key for Secrets Manager"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  key_usage               = "ENCRYPT_DECRYPT"
+  rotation_period_in_days = 90
+}
+
+
+resource "aws_kms_alias" "kms_secrets_key_alias" {
+  name          = "alias/secrets-key"
+  target_key_id = aws_kms_key.kms_secrets_key.key_id
+}
+
+resource "aws_kms_key_policy" "kms_secrets_key_policy" {
+  key_id = aws_kms_key.kms_secrets_key.key_id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Id      = "kms-secrets-key-policy",
+    Statement = [
+      {
+        Sid    = "EnableAccountAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        },
+        Action   = "kms:*",
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowSecretsManagerServiceAccess",
+        Effect = "Allow",
+        Principal = {
+          Service = "secretsmanager.amazonaws.com"
+        },
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ],
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowEC2RoleAccess",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${aws_iam_role.ec2_s3_role.name}"
+        },
+        Action = [
+          "kms:Decrypt",
+          "kms:DescribeKey"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "app_bucket_encryption" {
+  bucket = aws_s3_bucket.app_bucket.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = aws_kms_key.kms_s3_key.arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
+}
+
+
 
 data "aws_route53_zone" "primary" {
   name = "${var.subdomain}.${var.domain_name}"
@@ -770,5 +1134,58 @@ resource "aws_route53_record" "alb_record" {
     name                   = aws_lb.app_lb.dns_name
     zone_id                = aws_lb.app_lb.zone_id
     evaluate_target_health = true
+  }
+}
+
+locals {
+  is_demo_profile = var.aws_profile == "Demo-User"
+  certificate_arn = local.is_demo_profile ? var.demo_certificate_arn : aws_acm_certificate.dev_certificate[0].arn
+}
+
+resource "aws_acm_certificate" "dev_certificate" {
+  count             = var.aws_profile == "Demo-User" ? 0 : 1
+  domain_name       = "${var.subdomain}.${var.domain_name}"
+  validation_method = "DNS"
+  tags = {
+    Name = "dev-ssl-certificate"
+  }
+}
+
+resource "aws_route53_record" "dev_cert_validation_record" {
+  for_each = var.aws_profile == "Demo-User" ? {} : {
+    for dvo in aws_acm_certificate.dev_certificate[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  type            = each.value.type
+  ttl             = 60
+  zone_id         = data.aws_route53_zone.primary.zone_id
+}
+
+resource "aws_acm_certificate_validation" "dev_cert_validation" {
+  count                   = var.aws_profile == "Demo-User" ? 0 : 1
+  certificate_arn         = aws_acm_certificate.dev_certificate[0].arn
+  validation_record_fqdns = [for record in aws_route53_record.dev_cert_validation_record : record.fqdn]
+}
+
+
+
+
+resource "aws_lb_listener" "https_listener" {
+  load_balancer_arn = aws_lb.app_lb.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = local.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app_tg.arn
   }
 }
