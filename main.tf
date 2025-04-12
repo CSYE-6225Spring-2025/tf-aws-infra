@@ -93,12 +93,12 @@ resource "aws_route_table_association" "private" {
 resource "aws_security_group" "app_sg" {
   vpc_id = aws_vpc.main.id
 
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # ingress {
+  #   from_port   = 22
+  #   to_port     = 22
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
 
   # ingress {
   #   from_port   = 80
@@ -195,7 +195,7 @@ resource "random_password" "db_password" {
 
 # Store password in Secrets Manager
 resource "aws_secretsmanager_secret" "db_password" {
-  name        = "db-password-secret11"
+  name        = "db-password-secret13"
   description = "Secret containing the RDS database password"
   kms_key_id  = aws_kms_key.kms_secrets_key.arn
 }
